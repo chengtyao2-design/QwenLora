@@ -52,81 +52,63 @@ pip install -r requirements.txt
   鲁棒读取 CSV，自动尝试多编码。
 - `rating_to_numeric(rating_str)`:
   将 `"4 star"` 这类文本标签转换为整数标签。
-- `add_numeric_rating_column(df, source_col="Rating", target_col="rating_numeric")`:
+- `add_numeric_rating_column(df, source_col, target_col)`:
   为 DataFrame 添加数值标签列。
-- `balanced_sample(df, label_col, sample_size, seed, min_items_per_class=1)`:
-  采样时尽量保证类别覆盖，便于调试与快速实验。
 - `load_project_data(data_dir="./data")`:
   一次性加载 train/test/answer 三份数据并处理标签列。
-- `split_train_val(train_df, seed=5494, test_size=0.2, label_col="rating_numeric", debug_sample_size=None)`:
-  分层切分训练/验证集，可选下采样。
-- `build_example_library(train_df, n_per_rating=10, seed=5494, rating_col="rating_numeric")`:
+- `split_train_val(train_df, seed, test_size, label_col, debug_sample_size)`:
+  分层切分训练/验证集，可选下采样（直接 `sample` 截断）。
+- `build_example_library(train_df, n_per_rating, seed, rating_col)`:
   从训练集构建 few-shot 示例库。
-- `prepare_instruction_data(df, rating_col="rating_numeric")`:
+- `prepare_instruction_data(df, rating_col)`:
   将数据转成 SFT 指令样本 `instruction/input/output`。
-- `select_instruction_subset(records, max_samples)`:
-  选择部分样本用于快速实验。
 
 ### model.py
 
+- `DeviceInfo`:
+  设备信息 dataclass（device_type / device_name / total_memory_gb）。
 - `get_device_info()`:
-  自动识别运行设备并返回设备类型、名称、显存信息。
-- `get_device_map(device_type)`:
-  按设备返回 `transformers` 的加载策略。
-- `get_torch_dtype(device_type, prefer_bf16=True)`:
+  自动识别运行设备并返回 DeviceInfo。
+- `get_torch_dtype(device_type, prefer_bf16)`:
   按设备选择推理/训练 dtype。
-- `resolve_model_path(model_name, use_modelscope=False, cache_dir="./models")`:
+- `resolve_model_path(model_name, use_modelscope, cache_dir)`:
   解析模型来源（HF 或 ModelScope）。
 - `load_tokenizer_and_model(...)`:
-  统一加载 tokenizer 与基础模型。
+  统一加载 tokenizer 与基础模型，返回 `(tokenizer, model, model_path, device_info)`。
 - `build_zero_shot_prompt(title, review)`:
-  生成 zero-shot 提示词。
-- `build_nshot_prompt(title, review, examples, n=4, seed=None)`:
-  生成 few-shot 提示词。
-- `extract_rating_from_output(output_text, default_rating=3)`:
+  生成 zero-shot 提示词（Task A）。
+- `build_nshot_prompt(title, review, examples, n, seed)`:
+  生成 few-shot 提示词（Task B.1.1）。
+- `build_finetuned_prompt(title, review)`:
+  生成与 LoRA 指令微调数据格式对齐的提示词（Task B.1.2）。
+- `extract_rating_from_output(output_text, default_rating)`:
   从模型文本输出中解析评分。
-- `generate_response(...)`:
+- `generate_response(model, tokenizer, prompt, ...)`:
   统一单轮生成接口。
-- `predict_rating(model, tokenizer, prompt, ...)`:
-  一次调用返回原始输出和评分。
-- `generate_rating_finetuned(...)`:
-  微调模型专用评分生成接口。
 - `load_merged_lora_model(base_model_name, lora_dir, ...)`:
-  加载基础模型 + LoRA 并执行 merge，用于高效推理。
+  加载基础模型 + LoRA 并执行 merge，返回 `(tokenizer, merged_model, device_info)`。
 
 ### train.py
 
-- `InstructionDataset(records, tokenizer, max_length=512)`:
+- `InstructionDataset(records, tokenizer, max_length)`:
   将指令样本转成训练所需张量格式。
 - `LoraTrainingConfig`:
   LoRA 训练参数配置对象（路径、batch、学习率、LoRA 超参等）。
-- `select_records(records, max_samples)`:
-  训练前样本截断。
-- `attach_lora_adapter(model, config)`:
-  为基础模型挂载 LoRA。
-- `build_training_arguments(config)`:
-  构建 Hugging Face `TrainingArguments`。
-- `train_lora_model(base_model, tokenizer, train_records, val_records, config=None)`:
-  LoRA 微调主流程，训练后保存模型与 tokenizer。
+- `train_lora_model(base_model, tokenizer, train_records, val_records, config)`:
+  LoRA 微调主流程：挂载 adapter → 训练 → 保存模型与 tokenizer。
 
 ### eval.py
 
-- `run_inference_loop(data_df, predict_fn, id_col="Review_id", progress_every=50)`:
+- `run_inference_loop(data_df, predict_fn, id_col, progress_every)`:
   通用推理循环，负责收集预测、耗时和调试信息。
-- `run_zero_shot_inference(...)`:
+- `run_zero_shot_inference(model, tokenizer, test_df, max_new_tokens)`:
   Task A 零样本推理。
-- `run_nshot_inference(...)`:
+- `run_nshot_inference(model, tokenizer, test_df, example_library, n_shot, ...)`:
   Task B.1.1 few-shot 推理。
-- `run_lora_inference(...)`:
+- `run_lora_inference(lora_model, tokenizer, test_df, max_new_tokens)`:
   Task B.1.2 LoRA 微调后推理。
 - `evaluate_predictions(predictions_df, answer_df, ...)`:
   输出准确率、F1、报告和混淆矩阵。
-- `save_predictions(predictions_df, output_path)`:
-  导出预测 CSV。
-- `build_comparison_table(rows)`:
-  构建方法对比表。
-- `time_per_sample(total_seconds, sample_count)`:
-  计算单样本平均耗时。
 
 ## 5. 在 Notebook 中如何调用
 
@@ -182,6 +164,14 @@ tok_lora, merged_model, device = load_merged_lora_model(
 )
 lora_out = run_lora_inference(merged_model, tok_lora, test_df)
 lora_metric = evaluate_predictions(lora_out["predictions_df"], answer_df)
+
+# 8) 保存预测结果 & 对比（直接用 pandas，无需额外封装）
+zero_out["predictions_df"].to_csv("zero_shot_predictions.csv", index=False)
+comparison = pd.DataFrame([
+    {"method": "zero-shot", "accuracy": zero_metric["accuracy"], "macro_f1": zero_metric["macro_f1"]},
+    {"method": "n-shot",    "accuracy": nshot_metric["accuracy"], "macro_f1": nshot_metric["macro_f1"]},
+    {"method": "lora",      "accuracy": lora_metric["accuracy"],  "macro_f1": lora_metric["macro_f1"]},
+])
 ```
 
 ## 6. 目录说明

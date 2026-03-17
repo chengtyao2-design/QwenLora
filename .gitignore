@@ -2,3 +2,4 @@ data/
 requirements*.txt
 *.pdf
 CS5494_Final_Project_Notebook.ipynb
+.agent

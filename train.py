@@ -86,60 +86,6 @@ class LoraTrainingConfig:
     )
 
 
-def select_records(records: Sequence[Dict[str, str]], max_samples: Optional[int]) -> List[Dict[str, str]]:
-    """Select record subset for quick experiments."""
-    data = list(records)
-    if max_samples in (None, -1):
-        return data
-    return data[: max(0, max_samples)]
-
-
-def attach_lora_adapter(model, config: LoraTrainingConfig):
-    """Attach LoRA modules to the base CausalLM."""
-    peft_module = import_module("peft")
-    lora_config_cls = getattr(peft_module, "LoraConfig")
-    task_type_cls = getattr(peft_module, "TaskType")
-    get_peft_model_fn = getattr(peft_module, "get_peft_model")
-
-    lora_config = lora_config_cls(
-        task_type=task_type_cls.CAUSAL_LM,
-        r=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=config.target_modules,
-        bias="none",
-    )
-    lora_model = get_peft_model_fn(model, lora_config)
-    return lora_model
-
-
-def build_training_arguments(config: LoraTrainingConfig) -> TrainingArguments:
-    """Create TrainingArguments with transformers-version compatibility."""
-    if config.use_fp16 and config.use_bf16:
-        raise ValueError("Only one of use_fp16 or use_bf16 can be True.")
-
-    return TrainingArguments(
-        output_dir=config.output_dir,
-        num_train_epochs=float(config.num_train_epochs),
-        per_device_train_batch_size=int(config.train_batch_size),
-        per_device_eval_batch_size=int(config.eval_batch_size),
-        gradient_accumulation_steps=int(config.gradient_accumulation_steps),
-        learning_rate=float(config.learning_rate),
-        fp16=bool(config.use_fp16),
-        bf16=bool(config.use_bf16),
-        logging_strategy=config.logging_strategy,
-        save_strategy=config.save_strategy,
-        eval_strategy=config.eval_strategy,
-        save_total_limit=int(config.save_total_limit),
-        load_best_model_at_end=True,
-        metric_for_best_model="loss",
-        greater_is_better=False,
-        warmup_steps=int(config.warmup_steps),
-        report_to="none",
-        optim=config.optimizer_name,
-    )
-
-
 def train_lora_model(
     base_model,
     tokenizer,
@@ -147,18 +93,64 @@ def train_lora_model(
     val_records: Sequence[Dict[str, str]],
     config: Optional[LoraTrainingConfig] = None,
 ):
-    """Run LoRA fine-tuning and save the final adapter model."""
+    """Run LoRA fine-tuning and save the final adapter model.
+
+    Returns dict with trainer, model, timing, and output directory info.
+    """
     if config is None:
         config = LoraTrainingConfig()
 
-    train_subset = select_records(train_records, config.max_train_samples)
-    val_subset = select_records(val_records, config.max_val_samples)
+    # Optional sample truncation for quick experiments
+    train_data = list(train_records)
+    val_data = list(val_records)
+    if config.max_train_samples not in (None, -1):
+        train_data = train_data[: max(0, config.max_train_samples)]
+    if config.max_val_samples not in (None, -1):
+        val_data = val_data[: max(0, config.max_val_samples)]
 
-    train_dataset = InstructionDataset(train_subset, tokenizer, max_length=config.max_sequence_length)
-    val_dataset = InstructionDataset(val_subset, tokenizer, max_length=config.max_sequence_length)
+    train_dataset = InstructionDataset(train_data, tokenizer, max_length=config.max_sequence_length)
+    val_dataset = InstructionDataset(val_data, tokenizer, max_length=config.max_sequence_length)
 
-    model_for_training = attach_lora_adapter(base_model, config)
-    training_args = build_training_arguments(config)
+    # --- Attach LoRA adapter ---
+    peft_module = import_module("peft")
+    LoraConfig = getattr(peft_module, "LoraConfig")
+    TaskType = getattr(peft_module, "TaskType")
+    get_peft_model = getattr(peft_module, "get_peft_model")
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=config.target_modules,
+        bias="none",
+    )
+    model_for_training = get_peft_model(base_model, lora_config)
+
+    # --- Build TrainingArguments ---
+    if config.use_fp16 and config.use_bf16:
+        raise ValueError("Only one of use_fp16 or use_bf16 can be True.")
+
+    training_args = TrainingArguments(
+        output_dir=config.output_dir,
+        num_train_epochs=float(config.num_train_epochs),
+        per_device_train_batch_size=config.train_batch_size,
+        per_device_eval_batch_size=config.eval_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.learning_rate,
+        fp16=config.use_fp16,
+        bf16=config.use_bf16,
+        logging_strategy=config.logging_strategy,
+        save_strategy=config.save_strategy,
+        eval_strategy=config.eval_strategy,
+        save_total_limit=config.save_total_limit,
+        load_best_model_at_end=True,
+        metric_for_best_model="loss",
+        greater_is_better=False,
+        warmup_steps=config.warmup_steps,
+        report_to="none",
+        optim=config.optimizer_name,
+    )
 
     trainer = Trainer(
         model=model_for_training,
@@ -179,7 +171,7 @@ def train_lora_model(
         "trainer": trainer,
         "model": model_for_training,
         "train_seconds": train_seconds,
-        "train_samples": len(train_subset),
-        "val_samples": len(val_subset),
+        "train_samples": len(train_data),
+        "val_samples": len(val_data),
         "output_dir": config.final_dir,
     }

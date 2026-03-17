@@ -1,18 +1,16 @@
 import hashlib
-import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 
-from dataset import balanced_sample
 from model import (
+    build_finetuned_prompt,
     build_nshot_prompt,
     build_zero_shot_prompt,
     extract_rating_from_output,
-    generate_rating_finetuned,
-    predict_rating,
+    generate_response,
 )
 
 
@@ -85,27 +83,18 @@ def run_zero_shot_inference(
     tokenizer,
     test_df: pd.DataFrame,
     max_new_tokens: int = 10,
-    sample_size: Optional[int] = -1,
-    seed: int = 5494,
 ) -> Dict[str, Any]:
     """Task A: baseline zero-shot inference."""
-    subset = balanced_sample(test_df, label_col=None, sample_size=sample_size, seed=seed)
 
     def _predict(row: pd.Series) -> Dict[str, Any]:
         title = _default_title(row.get("Title"))
         review = str(row["Review"])
         prompt = build_zero_shot_prompt(title=title, review=review)
-        raw_output, predicted = predict_rating(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-        )
+        raw_output = generate_response(model=model, tokenizer=tokenizer, prompt=prompt, max_new_tokens=max_new_tokens)
+        predicted = extract_rating_from_output(raw_output)
         return {"raw_output": raw_output, "predicted_rating": predicted, "fallback_used": False}
 
-    output = run_inference_loop(subset, _predict)
-    output["subset_df"] = subset
-    return output
+    return run_inference_loop(test_df, _predict)
 
 
 def run_nshot_inference(
@@ -115,11 +104,9 @@ def run_nshot_inference(
     example_library: List[Dict[str, Any]],
     n_shot: int = 4,
     max_new_tokens: int = 10,
-    sample_size: Optional[int] = -1,
     seed: int = 5494,
 ) -> Dict[str, Any]:
     """Task B.1.1: N-shot in-context inference."""
-    subset = balanced_sample(test_df, label_col=None, sample_size=sample_size, seed=seed)
 
     def _predict(row: pd.Series) -> Dict[str, Any]:
         title = _default_title(row.get("Title"))
@@ -137,17 +124,11 @@ def run_nshot_inference(
             seed=row_seed,
         )
 
-        raw_output, predicted = predict_rating(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-        )
+        raw_output = generate_response(model=model, tokenizer=tokenizer, prompt=prompt, max_new_tokens=max_new_tokens)
+        predicted = extract_rating_from_output(raw_output)
         return {"raw_output": raw_output, "predicted_rating": predicted, "fallback_used": False}
 
-    output = run_inference_loop(subset, _predict)
-    output["subset_df"] = subset
-    return output
+    return run_inference_loop(test_df, _predict)
 
 
 def run_lora_inference(
@@ -155,55 +136,24 @@ def run_lora_inference(
     tokenizer,
     test_df: pd.DataFrame,
     max_new_tokens: int = 10,
-    sample_size: Optional[int] = -1,
-    seed: int = 5494,
 ) -> Dict[str, Any]:
     """Task B.1.2: merged LoRA model inference."""
-    subset = balanced_sample(test_df, label_col=None, sample_size=sample_size, seed=seed)
 
     def _predict(row: pd.Series) -> Dict[str, Any]:
         title = _default_title(row.get("Title"))
         review = str(row["Review"])
-
-        raw_output = generate_rating_finetuned(
+        prompt = build_finetuned_prompt(title=title, review=review)
+        raw_output = generate_response(
             model=lora_model,
             tokenizer=tokenizer,
-            title=title,
-            review=review,
+            prompt=prompt,
             max_new_tokens=max_new_tokens,
+            system_prompt="Return only integers 1-5 with no explanation.",
         )
-
-        regex_matches = re.findall(r"\b([1-5])\b", raw_output)
-        star_match = re.search(r"(\d+)\s*star", raw_output, flags=re.IGNORECASE)
         predicted = extract_rating_from_output(raw_output)
-        fallback_used = not regex_matches and star_match is None
+        return {"raw_output": raw_output, "predicted_rating": predicted}
 
-        return {
-            "raw_output": raw_output,
-            "predicted_rating": predicted,
-            "fallback_used": fallback_used,
-            "regex_matches": regex_matches,
-            "star_match": star_match.group(1) if star_match else None,
-        }
-
-    output = run_inference_loop(subset, _predict)
-    output["subset_df"] = subset
-
-    # Enrich debug records with parser diagnostics.
-    enriched_debug = []
-    for record, (_, row) in zip(output["debug_records"], subset.iterrows()):
-        raw_output = record["raw_output"]
-        regex_matches = re.findall(r"\b([1-5])\b", raw_output)
-        star_match = re.search(r"(\d+)\s*star", raw_output, flags=re.IGNORECASE)
-        enriched = dict(record)
-        enriched["regex_matches"] = regex_matches
-        enriched["star_match"] = star_match.group(1) if star_match else None
-        if "rating_numeric" in row:
-            enriched["true_rating"] = row["rating_numeric"]
-        enriched_debug.append(enriched)
-
-    output["debug_records"] = enriched_debug
-    return output
+    return run_inference_loop(test_df, _predict)
 
 
 def evaluate_predictions(
@@ -240,20 +190,3 @@ def evaluate_predictions(
         "classification_report": report_text,
         "confusion_matrix": cm,
     }
-
-
-def save_predictions(predictions_df: pd.DataFrame, output_path: str) -> None:
-    """Persist model predictions as CSV."""
-    predictions_df.to_csv(output_path, index=False)
-
-
-def build_comparison_table(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Create unified comparison table for baseline/n-shot/LoRA methods."""
-    return pd.DataFrame(rows)
-
-
-def time_per_sample(total_seconds: float, sample_count: int) -> float:
-    """Safe helper for reporting latency."""
-    if sample_count <= 0:
-        return 0.0
-    return total_seconds / sample_count

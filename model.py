@@ -63,22 +63,12 @@ def get_device_info() -> DeviceInfo:
     return DeviceInfo(device_type="cpu", device_name="CPU", total_memory_gb=None)
 
 
-def get_device_map(device_type: str) -> Optional[str]:
-    """Return transformers device_map strategy for each backend."""
-    if device_type == "cuda":
-        return "auto"
-    return None
-
-
 def get_torch_dtype(device_type: str, prefer_bf16: bool = True) -> torch.dtype:
     """Choose dtype by accelerator characteristics."""
     if device_type == "cuda":
         return torch.float16
     if device_type == "npu":
         return torch.bfloat16 if prefer_bf16 else torch.float16
-    if device_type == "mps":
-        # MPS is usually more stable with fp32.
-        return torch.float32
     return torch.float32
 
 
@@ -104,25 +94,33 @@ def load_tokenizer_and_model(
     prefer_bf16: bool = True,
     trust_remote_code: bool = True,
 ):
-    """Load tokenizer and CausalLM model with auto backend placement."""
+    """Load tokenizer and CausalLM model with auto backend placement.
+
+    Returns: (tokenizer, model, model_path, device_info)
+    """
     model_path = resolve_model_path(model_name=model_name, use_modelscope=use_modelscope, cache_dir=cache_dir)
 
     device = get_device_info()
+    dtype = get_torch_dtype(device.device_type, prefer_bf16=prefer_bf16)
+    device_map = "auto" if device.device_type == "cuda" else None
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=trust_remote_code,
-        torch_dtype=get_torch_dtype(device.device_type, prefer_bf16=prefer_bf16),
-        device_map=get_device_map(device.device_type),
+        torch_dtype=dtype,
+        device_map=device_map,
     )
 
     if device.device_type in ["npu", "mps"]:
-        if hasattr(model, "to"):
-            model_any: Any = model
-            model_any.to(torch.device(device.device_type))
+        model.to(torch.device(device.device_type))
 
     return tokenizer, model, model_path, device
 
+
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
 
 def build_zero_shot_prompt(title: str, review: str) -> str:
     """Build baseline prompt for Task A."""
@@ -188,6 +186,20 @@ def build_nshot_prompt(
     return "\n".join(lines)
 
 
+def build_finetuned_prompt(title: str, review: str) -> str:
+    """Build prompt aligned with LoRA instruction tuning data format."""
+    instruction = (
+        "Given the following restaurant review, rate it from 1 to 5 stars. "
+        "Respond ONLY with a single digit (1, 2, 3, 4, or 5). Do not include words or punctuation."
+    )
+    input_text = f"Title: {title}\nReview: {review}" if title else f"Review: {review}"
+    return f"{instruction}\n\n{input_text}\n\nRating (1-5):"
+
+
+# ---------------------------------------------------------------------------
+# Output parsing
+# ---------------------------------------------------------------------------
+
 def extract_rating_from_output(output_text: str, default_rating: int = 3) -> int:
     """Parse the first valid rating from model output."""
     numbers = re.findall(r"\b([1-5])\b", output_text)
@@ -203,19 +215,9 @@ def extract_rating_from_output(output_text: str, default_rating: int = 3) -> int
     return default_rating
 
 
-def _build_chat_inputs(
-    tokenizer,
-    prompt: str,
-    system_prompt: Optional[str] = None,
-) -> Any:
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return tokenizer([text], return_tensors="pt")
-
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
 
 def generate_response(
     model,
@@ -227,7 +229,13 @@ def generate_response(
     system_prompt: Optional[str] = None,
 ) -> str:
     """Run a single-turn generation and return decoded assistant text."""
-    model_inputs = _build_chat_inputs(tokenizer, prompt, system_prompt=system_prompt)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    model_inputs = tokenizer([text], return_tensors="pt")
     if hasattr(model_inputs, "to"):
         model_inputs = model_inputs.to(model.device)
 
@@ -240,57 +248,15 @@ def generate_response(
         )
 
     new_token_ids = [
-        output_ids[len(input_ids) :]
+        output_ids[len(input_ids):]
         for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
     return tokenizer.batch_decode(new_token_ids, skip_special_tokens=True)[0].strip()
 
 
-def predict_rating(
-    model,
-    tokenizer,
-    prompt: str,
-    max_new_tokens: int = 10,
-    system_prompt: Optional[str] = None,
-) -> Tuple[str, int]:
-    """Generate raw output and parsed rating in one call."""
-    output = generate_response(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=0.1,
-        do_sample=False,
-        system_prompt=system_prompt,
-    )
-    return output, extract_rating_from_output(output)
-
-
-def generate_rating_finetuned(
-    model,
-    tokenizer,
-    title: str,
-    review: str,
-    max_new_tokens: int = 10,
-) -> str:
-    """Inference format aligned with LoRA instruction tuning data."""
-    instruction = (
-        "Given the following restaurant review, rate it from 1 to 5 stars. "
-        "Respond ONLY with a single digit (1, 2, 3, 4, or 5). Do not include words or punctuation."
-    )
-    input_text = f"Title: {title}\nReview: {review}" if title else f"Review: {review}"
-    prompt = f"{instruction}\n\n{input_text}\n\nRating (1-5):"
-
-    return generate_response(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=0.1,
-        do_sample=False,
-        system_prompt="Return only integers 1-5 with no explanation.",
-    )
-
+# ---------------------------------------------------------------------------
+# LoRA model loading
+# ---------------------------------------------------------------------------
 
 def load_merged_lora_model(
     base_model_name: str,
@@ -299,9 +265,12 @@ def load_merged_lora_model(
     cache_dir: str = "./models",
     prefer_bf16: bool = True,
 ):
-    """Load base model, attach LoRA adapter, and merge weights for inference."""
+    """Load base model, attach LoRA adapter, and merge weights for inference.
+
+    Returns: (tokenizer, merged_model, device_info)
+    """
     peft_module = import_module("peft")
-    peft_model_class = getattr(peft_module, "PeftModel")
+    PeftModel = getattr(peft_module, "PeftModel")
 
     tokenizer, base_model, _, device = load_tokenizer_and_model(
         model_name=base_model_name,
@@ -310,7 +279,7 @@ def load_merged_lora_model(
         prefer_bf16=prefer_bf16,
     )
 
-    lora_model = peft_model_class.from_pretrained(base_model, lora_dir)
+    lora_model = PeftModel.from_pretrained(base_model, lora_dir)
     merged_model = lora_model.merge_and_unload()
 
     if device.device_type in ["npu", "mps"]:
