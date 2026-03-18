@@ -1,183 +1,115 @@
-# QwenLora Restaurant Review Rating Project
+# QwenLoRA 餐厅评论评分项目（简历展示版）
 
-## 1. 项目简介
+## 1. 项目定位
 
-本项目围绕课程任务实现了 3 条情感评分路线，目标是对餐厅评论做 1-5 星分类：
+本项目面向 1-5 星餐厅评论评分任务，围绕同一基础大模型构建三种可对比方案：
 
-- Task A: Zero-shot 推理
-- Task B.1.1: N-shot In-Context Learning
-- Task B.1.2: LoRA 指令微调后推理
+- Zero-shot：直接指令推理，作为低成本基线。
+- N-shot ICL：通过少量示例增强上下文，提高推理稳定性。
+- LoRA 指令微调：在参数高效微调框架下提升任务贴合度。
 
-数据默认位于 `data/`，核心代码拆分为 `dataset.py`、`model.py`、`train.py`、`eval.py`。
+项目重点不在业务页面，而在可复现实验流程、可迁移模型工程能力和完整评估闭环。
 
-## 2. 技术说明
+## 2. 技术栈
 
-- 模型框架: Transformers CausalLM
-- 参数高效微调: PEFT (LoRA)
-- 训练与评估: Hugging Face Trainer + sklearn 指标
-- 设备适配: 自动检测 CUDA / NPU / MPS / CPU
-- 推理输出解析: 正则抽取 1-5 星并提供回退策略
+- 语言与数据处理：Python、Pandas
+- 深度学习框架：PyTorch
+- 大模型生态：Hugging Face Transformers
+- 参数高效微调：PEFT (LoRA)
+- 训练编排：Hugging Face Trainer
+- 评估体系：scikit-learn（Accuracy、Macro-F1、Weighted-F1、Confusion Matrix）
+- 多硬件适配：CUDA / NPU / MPS / CPU 自动识别与精度策略切换
 
-评估指标包含：
+## 3. 技术实现
 
-- Accuracy
-- Macro-F1
-- Weighted-F1
-- Classification Report
-- Confusion Matrix
+### 3.1 数据与标签工程
 
-## 3. 环境与依赖
+- 采用多编码容错读取，降低公开数据源字符集不一致导致的读取失败风险。
+- 将原始文本标签统一映射到数值标签（1-5），并在训练/评估阶段保持同一标签语义。
+- 使用分层划分保证训练集和验证集类别分布一致，减少评估偏差。
 
-当前仓库已合并为单一依赖文件：`requirements.txt`。
+### 3.2 推理链路设计
 
-该文件按你的 GPU 环境（CUDA 12.8）配置了 PyTorch 源：
+- 统一 Prompt 协议，分别适配 Zero-shot、N-shot、LoRA 三类实验。
+- 统一生成接口，保证不同实验路线的可比性（输入结构、输出解析逻辑一致）。
+- 采用“格式优先 + 回退解析”策略提取评分，降低生成文本噪声对指标的影响。
 
-```txt
---extra-index-url https://download.pytorch.org/whl/cu128
-torch>=2.4
-...
+### 3.3 微调与部署设计
+
+- 基于 LoRA 仅训练增量参数，显著降低显存占用和训练成本。
+- 训练完成后进行权重合并，简化推理部署链路。
+- 模型加载支持本地缓存优先，避免重复下载带来的时间成本。
+
+### 3.4 评估与可追踪性
+
+- 推理阶段记录耗时、预测结果和解析回退统计，支持问题定位。
+- 评估阶段输出分类报告与混淆矩阵，便于识别类别级别误差。
+- 三路线共用评估口径，支持横向性能对比。
+
+## 4. 项目设计
+
+### 4.1 模块化分层
+
+- 数据层：数据读取、标签标准化、训练验证集拆分、ICL 示例库构建。
+- 模型层：设备探测、模型与分词器加载、Prompt 模板与生成接口。
+- 训练层：指令样本组织、LoRA 参数注入、Trainer 训练与导出。
+- 评估层：统一推理循环、预测结果汇总、指标计算与结果对比。
+
+这种分层设计使实验流程具备较好的可维护性与可复用性，便于快速替换模型规模或实验策略。
+
+### 4.2 工程取舍
+
+- 优先保证实验可复现：固定随机种子、固定数据切分策略、固定评估口径。
+- 优先保证运行鲁棒性：设备自动适配、解析失败回退、异常样本容错。
+- 优先保证扩展性：可在同一框架下接入更多 Prompt 策略或微调方案。
+
+## 5. 参数设计
+
+### 5.1 数据与采样参数
+
+- `seed=5494`：统一随机性控制，覆盖数据划分与示例抽样。
+- `test_size=0.2`：训练/验证比例。
+- `n_per_rating=10`：构建 N-shot 示例库时每个评分类别采样上限。
+- `debug_sample_size`：调试阶段快速抽样参数，缩短迭代周期。
+
+### 5.2 推理参数
+
+- `max_new_tokens=10`：限制生成长度，降低输出冗余。
+- `temperature=0.1`、`do_sample=False`：偏确定性解码，保证评估稳定。
+- `n_shot=4`：上下文示例数量控制，平衡性能与上下文长度。
+- 行级稳定随机种子：按样本 ID 生成稳定哈希，确保 N-shot 复现实验结果。
+
+### 5.3 训练参数
+
+- `max_sequence_length=1024`
+- `num_train_epochs=3`
+- `train_batch_size=8`、`eval_batch_size=8`
+- `gradient_accumulation_steps=1`
+- `learning_rate=1e-4`、`warmup_steps=10`
+- `optimizer=adamw_torch`
+- 混合精度开关：`bf16/fp16` 二选一
+
+### 5.4 LoRA 参数
+
+- `r=8`
+- `lora_alpha=16`
+- `lora_dropout=0.3`
+- `target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]`
+
+该参数组合用于在训练成本可控的前提下，提升评分任务上的表达能力与泛化表现。
+
+## 6. 未被 gitignore 的文件树
+
+以下文件树基于 Git 未忽略清单（已跟踪 + 未跟踪且未被忽略）整理：
+
+```text
+QwenLora/
+├── .gitignore
+├── README.md
+├── dataset.py
+├── eval.py
+├── model.py
+└── train.py
 ```
 
-安装方式：
-
-```bash
-pip install -r requirements.txt
-```
-
-## 4. 核心文件与函数说明
-
-### dataset.py
-
-- `read_csv_with_encoding(filepath, encodings=None)`:
-  鲁棒读取 CSV，自动尝试多编码。
-- `rating_to_numeric(rating_str)`:
-  将 `"4 star"` 这类文本标签转换为整数标签。
-- `add_numeric_rating_column(df, source_col, target_col)`:
-  为 DataFrame 添加数值标签列。
-- `load_project_data(data_dir="./data")`:
-  一次性加载 train/test/answer 三份数据并处理标签列。
-- `split_train_val(train_df, seed, test_size, label_col, debug_sample_size)`:
-  分层切分训练/验证集，可选下采样（直接 `sample` 截断）。
-- `build_example_library(train_df, n_per_rating, seed, rating_col)`:
-  从训练集构建 few-shot 示例库。
-- `prepare_instruction_data(df, rating_col)`:
-  将数据转成 SFT 指令样本 `instruction/input/output`。
-
-### model.py
-
-- `DeviceInfo`:
-  设备信息 dataclass（device_type / device_name / total_memory_gb）。
-- `get_device_info()`:
-  自动识别运行设备并返回 DeviceInfo。
-- `get_torch_dtype(device_type, prefer_bf16)`:
-  按设备选择推理/训练 dtype。
-- `resolve_model_path(model_name, use_modelscope, cache_dir)`:
-  解析模型来源（HF 或 ModelScope）。
-- `load_tokenizer_and_model(...)`:
-  统一加载 tokenizer 与基础模型，返回 `(tokenizer, model, model_path, device_info)`。
-- `build_zero_shot_prompt(title, review)`:
-  生成 zero-shot 提示词（Task A）。
-- `build_nshot_prompt(title, review, examples, n, seed)`:
-  生成 few-shot 提示词（Task B.1.1）。
-- `build_finetuned_prompt(title, review)`:
-  生成与 LoRA 指令微调数据格式对齐的提示词（Task B.1.2）。
-- `extract_rating_from_output(output_text, default_rating)`:
-  从模型文本输出中解析评分。
-- `generate_response(model, tokenizer, prompt, ...)`:
-  统一单轮生成接口。
-- `load_merged_lora_model(base_model_name, lora_dir, ...)`:
-  加载基础模型 + LoRA 并执行 merge，返回 `(tokenizer, merged_model, device_info)`。
-
-### train.py
-
-- `InstructionDataset(records, tokenizer, max_length)`:
-  将指令样本转成训练所需张量格式。
-- `LoraTrainingConfig`:
-  LoRA 训练参数配置对象（路径、batch、学习率、LoRA 超参等）。
-- `train_lora_model(base_model, tokenizer, train_records, val_records, config)`:
-  LoRA 微调主流程：挂载 adapter → 训练 → 保存模型与 tokenizer。
-
-### eval.py
-
-- `run_inference_loop(data_df, predict_fn, id_col, progress_every)`:
-  通用推理循环，负责收集预测、耗时和调试信息。
-- `run_zero_shot_inference(model, tokenizer, test_df, max_new_tokens)`:
-  Task A 零样本推理。
-- `run_nshot_inference(model, tokenizer, test_df, example_library, n_shot, ...)`:
-  Task B.1.1 few-shot 推理。
-- `run_lora_inference(lora_model, tokenizer, test_df, max_new_tokens)`:
-  Task B.1.2 LoRA 微调后推理。
-- `evaluate_predictions(predictions_df, answer_df, ...)`:
-  输出准确率、F1、报告和混淆矩阵。
-
-## 5. 在 Notebook 中如何调用
-
-下面给出推荐调用顺序（按实验流程）：
-
-```python
-from dataset import (
-    load_project_data,
-    split_train_val,
-    build_example_library,
-    prepare_instruction_data,
-)
-from model import load_tokenizer_and_model, load_merged_lora_model
-from train import LoraTrainingConfig, train_lora_model
-from eval import (
-    run_zero_shot_inference,
-    run_nshot_inference,
-    run_lora_inference,
-    evaluate_predictions,
-)
-
-# 1) 读数据
-train_df, test_df, answer_df = load_project_data("./data")
-
-# 2) 切分训练/验证
-train_split, val_split = split_train_val(train_df, seed=5494, test_size=0.2)
-
-# 3) 加载基础模型
-tokenizer, base_model, model_path, device = load_tokenizer_and_model(
-    model_name="Qwen/Qwen2.5-0.5B-Instruct",
-    use_modelscope=False,
-)
-
-# 4) Zero-shot
-zero_out = run_zero_shot_inference(base_model, tokenizer, test_df)
-zero_metric = evaluate_predictions(zero_out["predictions_df"], answer_df)
-
-# 5) N-shot
-example_lib = build_example_library(train_split, n_per_rating=10, seed=5494)
-nshot_out = run_nshot_inference(base_model, tokenizer, test_df, example_lib, n_shot=4)
-nshot_metric = evaluate_predictions(nshot_out["predictions_df"], answer_df)
-
-# 6) LoRA 训练
-train_records = prepare_instruction_data(train_split)
-val_records = prepare_instruction_data(val_split)
-cfg = LoraTrainingConfig(output_dir="./qwen_lora_checkpoints", final_dir="./qwen_lora_final")
-train_res = train_lora_model(base_model, tokenizer, train_records, val_records, cfg)
-
-# 7) LoRA 推理（merge 后）
-tok_lora, merged_model, device = load_merged_lora_model(
-    base_model_name="Qwen/Qwen2.5-0.5B-Instruct",
-    lora_dir=train_res["output_dir"],
-)
-lora_out = run_lora_inference(merged_model, tok_lora, test_df)
-lora_metric = evaluate_predictions(lora_out["predictions_df"], answer_df)
-
-# 8) 保存预测结果 & 对比（直接用 pandas，无需额外封装）
-zero_out["predictions_df"].to_csv("zero_shot_predictions.csv", index=False)
-comparison = pd.DataFrame([
-    {"method": "zero-shot", "accuracy": zero_metric["accuracy"], "macro_f1": zero_metric["macro_f1"]},
-    {"method": "n-shot",    "accuracy": nshot_metric["accuracy"], "macro_f1": nshot_metric["macro_f1"]},
-    {"method": "lora",      "accuracy": lora_metric["accuracy"],  "macro_f1": lora_metric["macro_f1"]},
-])
-```
-
-## 6. 目录说明
-
-- `dataset.py`: 数据读取、标签处理、划分、指令样本构造
-- `model.py`: 模型加载、prompt 构建、生成与评分解析
-- `train.py`: LoRA 训练流程
-- `eval.py`: 推理与评估流程
-- `requirements.txt`: 单一依赖文件（GPU/CUDA 12.8）
+说明：数据集、模型权重、实验输出与中间检查点目录已通过 `.gitignore` 排除，不纳入版本库主体。
