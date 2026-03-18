@@ -1,4 +1,6 @@
+import os
 import re
+import glob
 import random
 from importlib import import_module
 from dataclasses import dataclass
@@ -72,15 +74,53 @@ def get_torch_dtype(device_type: str, prefer_bf16: bool = True) -> torch.dtype:
     return torch.float32
 
 
+def _find_local_model_dir(model_name: str, cache_dir: str) -> Optional[str]:
+    """检查本地缓存是否已有完整模型（含 config.json + 权重文件）。
+
+    ModelScope 在 Windows 上会把 model_name 里的 '.' 替换成 '___'，
+    所以这里两种路径都检查一下。找到就返回路径，没找到返回 None。
+    """
+    original_dir = os.path.join(cache_dir, model_name)
+    escaped_name = model_name.replace(".", "___")
+    escaped_dir = os.path.join(cache_dir, escaped_name)
+
+    for candidate in [original_dir, escaped_dir]:
+        candidate = os.path.normpath(candidate)
+        if not os.path.isdir(candidate):
+            continue
+        # 必须有 config.json
+        if not os.path.isfile(os.path.join(candidate, "config.json")):
+            continue
+        # 必须有权重文件 (.safetensors 或 .bin)
+        has_weights = (
+            glob.glob(os.path.join(candidate, "*.safetensors"))
+            or glob.glob(os.path.join(candidate, "*.bin"))
+        )
+        if has_weights:
+            return candidate
+
+    return None
+
+
 def resolve_model_path(
     model_name: str,
     use_modelscope: bool = False,
     cache_dir: str = "./models",
 ) -> str:
-    """Resolve model source path from Hugging Face id or ModelScope mirror."""
+    """Resolve model source path from Hugging Face id or ModelScope mirror.
+
+    如果本地缓存已有完整模型，直接返回本地路径，不再联网下载/校验。
+    """
     if not use_modelscope:
         return model_name
 
+    # 先检查本地是否已经下载完成
+    local_path = _find_local_model_dir(model_name, cache_dir)
+    if local_path is not None:
+        print(f"本地缓存命中，跳过下载: {local_path}")
+        return local_path
+
+    # 本地没找到，才走 ModelScope 下载
     modelscope_module = import_module("modelscope")
     snapshot_download = getattr(modelscope_module, "snapshot_download")
 
@@ -122,20 +162,26 @@ def load_tokenizer_and_model(
 # Prompt builders
 # ---------------------------------------------------------------------------
 
+PROMPT_HEADER = (
+    "Given the following restaurant review, please rate it from 1 to 5 stars, where:\n"
+    "- 1 star: Very poor experience\n"
+    "- 2 stars: Poor experience\n"
+    "- 3 stars: Average experience\n"
+    "- 4 stars: Good experience\n"
+    "- 5 stars: Excellent experience"
+)
+
+PROMPT_FOOTER = (
+    "Please provide only a single number (1, 2, 3, 4, or 5) as your rating.\n"
+    "Return format: `Rating: <digit>` (no explanation).\n"
+    "Rating: "
+)
+
+
 def build_zero_shot_prompt(title: str, review: str) -> str:
     """Build baseline prompt for Task A."""
-    return f"""Given the following restaurant review, please rate it from 1 to 5 stars, where:
-- 1 star: Very poor experience
-- 2 stars: Poor experience
-- 3 stars: Average experience
-- 4 stars: Good experience
-- 5 stars: Excellent experience
-
-Title: {title}
-Review: {review}
-
-Please provide only a single number (1, 2, 3, 4, or 5) as your rating.
-Rating: """
+    input_text = f"Title: {title}\nReview: {review}" if title else f"Review: {review}"
+    return f"{PROMPT_HEADER}\n\n{input_text}\n\n{PROMPT_FOOTER}"
 
 
 def build_nshot_prompt(
@@ -154,13 +200,7 @@ def build_nshot_prompt(
     else:
         selected = random.sample(examples, k=k)
 
-    lines = [
-        "You are an expert restaurant reviewer. Rate each review strictly on a 1-5 integer scale.",
-        "Follow the rubric: 1=awful, 2=poor, 3=average, 4=good, 5=excellent.",
-        "Respond ONLY in the format `Rating: <digit>` with no extra text.",
-        "",
-        "Examples:",
-    ]
+    lines = [PROMPT_HEADER, "", "Here are some examples as below:"]
 
     for idx, ex in enumerate(selected, start=1):
         lines.append(f"### Example {idx}")
@@ -176,42 +216,51 @@ def build_nshot_prompt(
         lines.append("")
 
     lines.append("### Query Review")
-    if title:
-        lines.append(f"Title: {title}")
-    lines.append(f"Review: {review}")
+    input_text = f"Title: {title}\nReview: {review}" if title else f"Review: {review}"
+    lines.append(input_text)
     lines.append("")
-    lines.append("Return format: `Rating: <digit>` (no explanation).")
-    lines.append("Rating: ")
+
+    lines.append(PROMPT_FOOTER.strip("\n"))
 
     return "\n".join(lines)
 
 
 def build_finetuned_prompt(title: str, review: str) -> str:
     """Build prompt aligned with LoRA instruction tuning data format."""
-    instruction = (
-        "Given the following restaurant review, rate it from 1 to 5 stars. "
-        "Respond ONLY with a single digit (1, 2, 3, 4, or 5). Do not include words or punctuation."
-    )
     input_text = f"Title: {title}\nReview: {review}" if title else f"Review: {review}"
-    return f"{instruction}\n\n{input_text}\n\nRating (1-5):"
+    return f"{PROMPT_HEADER}\n\n{input_text}\n\n{PROMPT_FOOTER}"
 
 
 # ---------------------------------------------------------------------------
 # Output parsing
 # ---------------------------------------------------------------------------
 
-def extract_rating_from_output(output_text: str, default_rating: int = 3) -> int:
-    """Parse the first valid rating from model output."""
+def extract_rating_from_output(
+    output_text: str,
+    default_rating: int = 3,
+    return_parse_info: bool = False,
+):
+    """Parse rating from model output.
+
+    Priority: 1) `Rating: <digit>`  2) first standalone digit in 1..5.
+    If `return_parse_info=True`, return `(rating, parse_failed)`.
+    """
+    rating_match = re.search(r"rating\s*[:：]\s*([1-5])\b", output_text, flags=re.IGNORECASE)
+    if rating_match:
+        rating = int(rating_match.group(1))
+        if return_parse_info:
+            return rating, False
+        return rating
+
     numbers = re.findall(r"\b([1-5])\b", output_text)
     if numbers:
-        return int(numbers[0])
+        rating = int(numbers[0])
+        if return_parse_info:
+            return rating, False
+        return rating
 
-    star_match = re.search(r"(\d+)\s*star", output_text, flags=re.IGNORECASE)
-    if star_match:
-        candidate = int(star_match.group(1))
-        if 1 <= candidate <= 5:
-            return candidate
-
+    if return_parse_info:
+        return default_rating, True
     return default_rating
 
 

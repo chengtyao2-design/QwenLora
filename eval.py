@@ -29,6 +29,7 @@ def run_inference_loop(
     """Generic inference loop that records predictions and runtime."""
     ids: List[Any] = []
     predictions: List[int] = []
+    parse_fallbacks: List[bool] = []
     debug_records: List[Dict[str, Any]] = []
 
     start = time.time()
@@ -48,6 +49,7 @@ def run_inference_loop(
 
         ids.append(review_id)
         predictions.append(predicted_rating)
+        parse_fallbacks.append(fallback_used)
         debug_records.append(
             {
                 "sample_idx": step,
@@ -68,6 +70,13 @@ def run_inference_loop(
             id_col: ids,
             "Predicted_Rating": predictions,
         }
+    )
+    parse_failure_count = int(sum(parse_fallbacks))
+    parse_failure_total = len(parse_fallbacks)
+    prediction_df.attrs["parse_failure_count"] = parse_failure_count
+    prediction_df.attrs["parse_failure_total"] = parse_failure_total
+    prediction_df.attrs["parse_failure_rate"] = (
+        parse_failure_count / parse_failure_total if parse_failure_total > 0 else 0.0
     )
 
     return {
@@ -91,8 +100,9 @@ def run_zero_shot_inference(
         review = str(row["Review"])
         prompt = build_zero_shot_prompt(title=title, review=review)
         raw_output = generate_response(model=model, tokenizer=tokenizer, prompt=prompt, max_new_tokens=max_new_tokens)
-        predicted = extract_rating_from_output(raw_output)
-        return {"raw_output": raw_output, "predicted_rating": predicted, "fallback_used": False}
+        parsed = extract_rating_from_output(raw_output, return_parse_info=True)
+        predicted, parse_failed = parsed if isinstance(parsed, tuple) else (int(parsed), False)
+        return {"raw_output": raw_output, "predicted_rating": predicted, "fallback_used": parse_failed}
 
     return run_inference_loop(test_df, _predict)
 
@@ -125,8 +135,9 @@ def run_nshot_inference(
         )
 
         raw_output = generate_response(model=model, tokenizer=tokenizer, prompt=prompt, max_new_tokens=max_new_tokens)
-        predicted = extract_rating_from_output(raw_output)
-        return {"raw_output": raw_output, "predicted_rating": predicted, "fallback_used": False}
+        parsed = extract_rating_from_output(raw_output, return_parse_info=True)
+        predicted, parse_failed = parsed if isinstance(parsed, tuple) else (int(parsed), False)
+        return {"raw_output": raw_output, "predicted_rating": predicted, "fallback_used": parse_failed}
 
     return run_inference_loop(test_df, _predict)
 
@@ -148,10 +159,10 @@ def run_lora_inference(
             tokenizer=tokenizer,
             prompt=prompt,
             max_new_tokens=max_new_tokens,
-            system_prompt="Return only integers 1-5 with no explanation.",
         )
-        predicted = extract_rating_from_output(raw_output)
-        return {"raw_output": raw_output, "predicted_rating": predicted}
+        parsed = extract_rating_from_output(raw_output, return_parse_info=True)
+        predicted, parse_failed = parsed if isinstance(parsed, tuple) else (int(parsed), False)
+        return {"raw_output": raw_output, "predicted_rating": predicted, "fallback_used": parse_failed}
 
     return run_inference_loop(test_df, _predict)
 
@@ -182,6 +193,21 @@ def evaluate_predictions(
 
     cm = confusion_matrix(merged[true_col], merged[pred_col], labels=labels)
 
+    parse_failure_rate = None
+    parse_failure_count = None
+    if "Parse_Fallback_Used" in merged.columns:
+        parse_failure_count = int(merged["Parse_Fallback_Used"].astype(bool).sum())
+        parse_failure_rate = parse_failure_count / len(merged) if len(merged) > 0 else 0.0
+        print(f"Parse fallback rate: {parse_failure_rate:.4f} ({parse_failure_count}/{len(merged)})")
+    else:
+        parse_failure_count = predictions_df.attrs.get("parse_failure_count")
+        parse_failure_total = predictions_df.attrs.get("parse_failure_total", len(merged))
+        if isinstance(parse_failure_count, int) and isinstance(parse_failure_total, int) and parse_failure_total > 0:
+            parse_failure_rate = parse_failure_count / parse_failure_total
+            print(f"Parse fallback rate: {parse_failure_rate:.4f} ({parse_failure_count}/{parse_failure_total})")
+        else:
+            print("Parse fallback rate: N/A (no parser tracking metadata)")
+
     return {
         "merged_df": merged,
         "accuracy": accuracy,
@@ -189,4 +215,6 @@ def evaluate_predictions(
         "weighted_f1": weighted_f1,
         "classification_report": report_text,
         "confusion_matrix": cm,
+        "parse_failure_rate": parse_failure_rate,
+        "parse_failure_count": parse_failure_count,
     }

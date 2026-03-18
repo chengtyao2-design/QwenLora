@@ -116,6 +116,8 @@ def prepare_instruction_data(
 	rating_col: str = "rating_numeric",
 ) -> List[Dict[str, str]]:
 	"""Convert row-wise review data into SFT instruction format."""
+	from model import PROMPT_HEADER, PROMPT_FOOTER
+
 	rows: List[Dict[str, str]] = []
 
 	for _, row in df.iterrows():
@@ -123,13 +125,19 @@ def prepare_instruction_data(
 		review = str(row["Review"])
 		rating = int(row[rating_col])
 
-		instruction = "Given the following restaurant review, rate it from 1 to 5 stars."
 		input_text = f"Title: {title}\nReview: {review}" if title else f"Review: {review}"
+		# To match the behavior of `build_finetuned_prompt`:
+		# f"{PROMPT_HEADER}\n\n{input_text}\n\n{PROMPT_FOOTER}"
+		# In train.py it does: f"{item['instruction']}\n\n{item['input']}"
+		# We set instruction to PROMPT_HEADER, and input to input_text \n\n PROMPT_FOOTER
 
 		rows.append(
 			{
-				"instruction": instruction,
-				"input": input_text,
+				"instruction": PROMPT_HEADER,
+				"input": f"{input_text}\n\n{PROMPT_FOOTER.strip()}", # using strip because user appending 'Rating: ' is expected by output text
+				# Wait, PROMPT_FOOTER ends with "Rating: ".
+				# If we let it be, then the expected output is just the number. 
+				# In train.py: {"role": "assistant", "content": item["output"]} -> str(rating)
 				"output": str(rating),
 			}
 		)

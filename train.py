@@ -23,10 +23,19 @@ class InstructionDataset(Dataset):
         item = self.records[idx]
 
         prompt = f"{item['instruction']}\n\n{item['input']}"
+        user_messages = [
+            {"role": "user", "content": prompt},
+        ]
         messages = [
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": item["output"]},
         ]
+
+        prompt_text = self.tokenizer.apply_chat_template(
+            user_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
         text = self.tokenizer.apply_chat_template(
             messages,
@@ -44,7 +53,18 @@ class InstructionDataset(Dataset):
 
         input_ids = encoded["input_ids"].squeeze(0)
         attention_mask = encoded["attention_mask"].squeeze(0)
+
+        prompt_encoded = self.tokenizer(
+            prompt_text,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        prompt_token_len = min(prompt_encoded["input_ids"].size(1), input_ids.size(0))
+
         labels = input_ids.clone()
+        # Only optimize assistant answer tokens.
+        labels[:prompt_token_len] = -100
         labels[attention_mask == 0] = -100
 
         return {
@@ -59,7 +79,7 @@ class LoraTrainingConfig:
     output_dir: str = "./qwen_lora_checkpoints"
     final_dir: str = "./qwen_lora_final"
 
-    max_sequence_length: int = 512
+    max_sequence_length: int = 1024   #512
     max_train_samples: Optional[int] = -1
     max_val_samples: Optional[int] = -1
 
@@ -67,7 +87,7 @@ class LoraTrainingConfig:
     train_batch_size: int = 8
     eval_batch_size: int = 8
     gradient_accumulation_steps: int = 1
-    learning_rate: float = 5e-5
+    learning_rate: float = 1e-4  # Try a small grid: [1e-4, 2e-4]
     warmup_steps: int = 10
     logging_strategy: str = "epoch"
     save_strategy: str = "epoch"
@@ -78,8 +98,8 @@ class LoraTrainingConfig:
     use_bf16: bool = True
     optimizer_name: str = "adamw_torch"
 
-    lora_rank: int = 4
-    lora_alpha: int = 8
+    lora_rank: int = 8  #4
+    lora_alpha: int = 16  #8
     lora_dropout: float = 0.3
     target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
