@@ -104,6 +104,7 @@ class LoraTrainingConfig:
     target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )
+    use_qlora: bool = False  # 开启后底座模型需已用 4-bit 加载（即 load_tokenizer_and_model 的 use_qlora=True）
 
 
 def train_lora_model(
@@ -136,6 +137,12 @@ def train_lora_model(
     LoraConfig = getattr(peft_module, "LoraConfig")
     TaskType = getattr(peft_module, "TaskType")
     get_peft_model = getattr(peft_module, "get_peft_model")
+
+    # QLoRA: 4-bit 模型在训练前必须执行此准备步骤
+    # 作用：将 LayerNorm 等层转回 fp32、开启 gradient checkpointing，避免反向传播数値不稳定
+    if config.use_qlora:
+        prepare_model_for_kbit_training = getattr(peft_module, "prepare_model_for_kbit_training")
+        base_model = prepare_model_for_kbit_training(base_model)
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -170,6 +177,8 @@ def train_lora_model(
         warmup_steps=config.warmup_steps,
         report_to="none",
         optim=config.optimizer_name,
+        # [QLoRA] use_reentrant=False 避免 bf16 + gradient checkpointing 在新 GPU 上的 CUBLAS 错误
+        gradient_checkpointing_kwargs={"use_reentrant": False} if config.use_qlora else None,
     )
 
     trainer = Trainer(

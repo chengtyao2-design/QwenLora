@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
 @dataclass
@@ -133,9 +133,11 @@ def load_tokenizer_and_model(
     cache_dir: str = "./models",
     prefer_bf16: bool = True,
     trust_remote_code: bool = True,
+    use_qlora: bool = False,
 ):
     """Load tokenizer and CausalLM model with auto backend placement.
 
+    use_qlora=True: 以 4-bit NF4 量化加载底座模型（QLoRA 模式），可大幅降低显存占用。
     Returns: (tokenizer, model, model_path, device_info)
     """
     model_path = resolve_model_path(model_name=model_name, use_modelscope=use_modelscope, cache_dir=cache_dir)
@@ -144,12 +146,23 @@ def load_tokenizer_and_model(
     dtype = get_torch_dtype(device.device_type, prefer_bf16=prefer_bf16)
     device_map = "auto" if device.device_type == "cuda" else None
 
+    # QLoRA: 4-bit 量化配置，仅在 use_qlora=True 时生效
+    quantization_config = None
+    if use_qlora:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",          # NF4 是 QLoRA 论文推荐格式
+            bnb_4bit_compute_dtype=dtype,        # 计算时用 bf16/fp16，节省显存
+            bnb_4bit_use_double_quant=True,      # 双重量化，进一步压缩
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=trust_remote_code,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map=device_map,
+        quantization_config=quantization_config,  # None 时等价于原来的行为
     )
 
     if device.device_type in ["npu", "mps"]:
