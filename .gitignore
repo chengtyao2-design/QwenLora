@@ -1,5 +1,6 @@
 data/
-notebooks/
+CS5494_Final_Project_Notebook.ipynb
+CS5494_Final_Project.pdf
 __pycache__/
 models/
 outputs/
