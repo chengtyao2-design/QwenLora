@@ -114,32 +114,49 @@ def build_example_library(
 def prepare_instruction_data(
 	df: pd.DataFrame,
 	rating_col: str = "rating_numeric",
+	oversample: bool = False,
+	seed: int = 42,
 ) -> List[Dict[str, str]]:
-	"""Convert row-wise review data into SFT instruction format."""
+	"""Convert row-wise review data into SFT instruction format.
+
+	oversample=True: 对少数类做随机重复采样，使各类数量与最多类持平，[v2]
+	有助于缓解类别不平衡对 Macro-F1 的影响。
+	"""
+	import random
 	from model import PROMPT_HEADER, PROMPT_FOOTER
 
-	rows: List[Dict[str, str]] = []
-
-	for _, row in df.iterrows():
+	def _row_to_record(row):
 		title = str(row["Title"]) if pd.notna(row.get("Title")) else ""
 		review = str(row["Review"])
 		rating = int(row[rating_col])
-
 		input_text = f"Title: {title}\nReview: {review}" if title else f"Review: {review}"
-		# To match the behavior of `build_finetuned_prompt`:
-		# f"{PROMPT_HEADER}\n\n{input_text}\n\n{PROMPT_FOOTER}"
-		# In train.py it does: f"{item['instruction']}\n\n{item['input']}"
-		# We set instruction to PROMPT_HEADER, and input to input_text \n\n PROMPT_FOOTER
+		return {
+			"instruction": PROMPT_HEADER,
+			"input": f"{input_text}\n\n{PROMPT_FOOTER.strip()}",
+			"output": str(rating),
+		}
 
-		rows.append(
-			{
-				"instruction": PROMPT_HEADER,
-				"input": f"{input_text}\n\n{PROMPT_FOOTER.strip()}", # using strip because user appending 'Rating: ' is expected by output text
-				# Wait, PROMPT_FOOTER ends with "Rating: ".
-				# If we let it be, then the expected output is just the number. 
-				# In train.py: {"role": "assistant", "content": item["output"]} -> str(rating)
-				"output": str(rating),
-			}
-		)
+	# 按类别分组[v2]
+	groups: Dict[int, List] = {r: [] for r in range(1, 6)}
+	for _, row in df.iterrows():
+		groups[int(row[rating_col])].append(row)
 
+	if not oversample:
+		rows = [_row_to_record(row) for rows_in_group in groups.values() for row in rows_in_group]
+		return rows
+
+	# 过采样：以最多类数量为目标，对其他类随机重复抽取[v2]
+	rng = random.Random(seed)
+	max_count = max(len(v) for v in groups.values() if v)
+	rows: List[Dict[str, str]] = []
+	for rating, group_rows in groups.items():
+		if not group_rows:
+			continue
+		sampled = group_rows[:]
+		while len(sampled) < max_count:
+			sampled.append(rng.choice(group_rows))
+		for row in sampled:
+			rows.append(_row_to_record(row))
+
+	rng.shuffle(rows)
 	return rows

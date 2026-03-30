@@ -6,6 +6,7 @@ from importlib import import_module
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -203,11 +204,27 @@ def build_nshot_prompt(
     examples: List[Dict],
     n: int = 4,
     seed: Optional[int] = None,
+    use_semantic: bool = False,
+    embeddings: Optional["np.ndarray"] = None,
+    query_embedding: Optional["np.ndarray"] = None,
 ) -> str:
-    """Build few-shot prompt for Task B.1.1."""
+    """Build few-shot prompt for Task B.1.1.[v2]
+
+    use_semantic=False（默认）：随机采样，与原行为完全一致。
+    use_semantic=True：用 cosine similarity 选最相近的 n 个例子（需传入
+      embeddings=build_example_embeddings(examples) 和
+      query_embedding=build_example_embeddings([{"review": review}])[0]）。
+    """
     k = min(n, len(examples))
     if k <= 0:
         selected = []
+    elif use_semantic and embeddings is not None and query_embedding is not None:
+        # cosine similarity 排序[v2]
+        emb_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9)
+        q_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-9)
+        sims = emb_norm @ q_norm
+        top_indices = np.argsort(sims)[::-1][:k]
+        selected = [examples[i] for i in top_indices]
     elif seed is not None:
         selected = random.Random(seed).sample(examples, k=k)
     else:
@@ -278,6 +295,45 @@ def extract_rating_from_output(
 
 
 # ---------------------------------------------------------------------------
+# Logits-based rating classification（分类式推理，比生成式快 5~10×)[v2]
+# ---------------------------------------------------------------------------
+
+def classify_rating_by_logits(
+    model,
+    tokenizer,
+    prompt: str,
+    system_prompt: Optional[str] = None,
+) -> int:
+    """直接比较 '1'~'5' 五个 token 的 logits，取 argmax 返回评分（1~5）。
+
+    相比 generate_response + parse，推理速度快 5~10 倍，且不存在解析失败的情况。
+    """
+    # 构建与 generate_response 一致的消息格式
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    model_inputs = tokenizer([text], return_tensors="pt")
+    if hasattr(model_inputs, "to"):
+        model_inputs = model_inputs.to(model.device)
+
+    # 获取 '1'~'5' 对应的 token id（取单字符编码的第一个 token）
+    rating_token_ids = [
+        tokenizer.encode(str(r), add_special_tokens=False)[0] for r in range(1, 6)
+    ]
+
+    with torch.no_grad():
+        outputs = model(**model_inputs)
+    # 取最后一个位置的 logits，比较 5 个候选 token
+    last_logits = outputs.logits[0, -1, :]  # shape: (vocab_size,)
+    candidate_logits = last_logits[rating_token_ids]
+    best_idx = int(candidate_logits.argmax().item())
+    return best_idx + 1  # 1~5
+
+
+# ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
 
@@ -314,6 +370,92 @@ def generate_response(
         for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
     return tokenizer.batch_decode(new_token_ids, skip_special_tokens=True)[0].strip()
+
+
+def generate_response_batch(
+    model,
+    tokenizer,
+    prompts: List[str],
+    batch_size: int = 8,
+    max_new_tokens: int = 10,
+    temperature: float = 0.1,
+    do_sample: bool = False,
+    system_prompt: Optional[str] = None,
+) -> List[str]:
+    """批量推理，将 prompts 分批送入 model.generate，速度比逐条快数倍。[v2]
+
+    Returns: 与 prompts 顺序对应的解码字符串列表。
+    """
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    def _build_text(prompt):
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    all_outputs: List[str] = []
+    for batch_start in range(0, len(prompts), batch_size):
+        batch_texts = [_build_text(p) for p in prompts[batch_start: batch_start + batch_size]]
+        model_inputs = tokenizer(
+            batch_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        if hasattr(model_inputs, "to"):
+            model_inputs = model_inputs.to(model.device)
+
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+            )
+
+        for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids):
+            new_ids = output_ids[len(input_ids):]
+            all_outputs.append(tokenizer.decode(new_ids, skip_special_tokens=True).strip())
+
+    return all_outputs
+
+
+# ---------------------------------------------------------------------------
+# 语义嵌入工具（配合 build_nshot_prompt use_semantic 模式使用）
+# ---------------------------------------------------------------------------
+
+def build_example_embeddings(
+    examples: List[Dict],
+    model_name: str = "all-MiniLM-L6-v2",
+    text_key: str = "review",
+) -> "np.ndarray":
+    """用 sentence-transformers 对 examples 列表做嵌入，返回 (N, D) 的 numpy 数组。
+
+    配合 build_nshot_prompt(use_semantic=True, embeddings=..., query_embedding=...) 使用。
+    需安装 sentence-transformers：pip install sentence-transformers
+
+    示例：
+        embs = build_example_embeddings(example_library)
+        query_emb = build_example_embeddings([{"review": review}])[0]
+        prompt = build_nshot_prompt(
+            title, review, example_library,
+            use_semantic=True, embeddings=embs, query_embedding=query_emb,
+        )
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError(
+            "请先安装 sentence-transformers：pip install sentence-transformers"
+        )
+
+    st_model = SentenceTransformer(model_name)
+    texts = [str(ex.get(text_key, "")) for ex in examples]
+    embeddings = st_model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    return embeddings  # shape: (N, D)
 
 
 # ---------------------------------------------------------------------------

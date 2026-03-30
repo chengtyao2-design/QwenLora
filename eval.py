@@ -9,8 +9,10 @@ from model import (
     build_finetuned_prompt,
     build_nshot_prompt,
     build_zero_shot_prompt,
+    classify_rating_by_logits, #[v2]
     extract_rating_from_output,
     generate_response,
+    generate_response_batch, #[v2]
 )
 
 
@@ -18,6 +20,37 @@ def _default_title(value: Any) -> str:
     if pd.isna(value):
         return ""
     return str(value)
+
+
+def plot_confusion_matrix(cm, labels=None):
+    """用 seaborn heatmap 画混淆矩阵，返回 matplotlib Figure。[v2]
+
+    labels: 如 ["1星", "2星", "3星", "4星", "5星"]，默认用数字序号。
+    示例：
+        fig = plot_confusion_matrix(result["confusion_matrix"], labels=["1星","2星","3星","4星","5星"])
+        display(fig)  # Jupyter Notebook 直接显示
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    if labels is None:
+        labels = [str(i) for i in range(1, cm.shape[0] + 1)]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=labels,
+        yticklabels=labels,
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Confusion Matrix")
+    fig.tight_layout()
+    return fig
 
 
 def run_inference_loop(
@@ -215,6 +248,143 @@ def evaluate_predictions(
         "weighted_f1": weighted_f1,
         "classification_report": report_text,
         "confusion_matrix": cm,
+        "confusion_matrix_fig": plot_confusion_matrix(cm, labels=["1星", "2星", "3星", "4星", "5星"]), #[v2]
         "parse_failure_rate": parse_failure_rate,
         "parse_failure_count": parse_failure_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 批量推理函数（相比单条循环快数倍）[v2]
+# ---------------------------------------------------------------------------
+
+def run_zero_shot_inference_batch(
+    model,
+    tokenizer,
+    test_df: pd.DataFrame,
+    batch_size: int = 8,
+    max_new_tokens: int = 10,
+) -> Dict[str, Any]:
+    """批量版 zero-shot 推理，速度比逐条循环快数倍。"""
+    rows = list(test_df.iterrows())
+    prompts = [
+        build_zero_shot_prompt(
+            title=_default_title(row.get("Title")),
+            review=str(row["Review"]),
+        )
+        for _, row in rows
+    ]
+    raw_outputs = generate_response_batch(
+        model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens
+    )
+
+    ids, predictions, debug_records = [], [], []
+    start = time.time()
+    for step, ((_, row), raw_output) in enumerate(zip(rows, raw_outputs)):
+        parsed, parse_failed = extract_rating_from_output(raw_output, return_parse_info=True)
+        ids.append(row[test_df.columns[0] if "Review_id" not in test_df.columns else "Review_id"])
+        predictions.append(int(parsed))
+        debug_records.append({"sample_idx": step, "raw_output": raw_output,
+                               "predicted_rating": int(parsed), "fallback_used": parse_failed})
+
+    return _build_inference_result(test_df, ids, predictions, debug_records, time.time() - start)
+
+
+def run_nshot_inference_batch(
+    model,
+    tokenizer,
+    test_df: pd.DataFrame,
+    example_library: List[Dict[str, Any]],
+    n_shot: int = 4,
+    batch_size: int = 8,
+    max_new_tokens: int = 10,
+    seed: int = 5494,
+) -> Dict[str, Any]:
+    """批量版 N-shot 推理。"""
+    rows = list(test_df.iterrows())
+    prompts = []
+    for _, row in rows:
+        review_id_text = str(row.get("Review_id", ""))
+        stable_hash = int(hashlib.md5(review_id_text.encode("utf-8")).hexdigest()[:8], 16)
+        row_seed = seed + (stable_hash % 1_000_000)
+        prompts.append(build_nshot_prompt(
+            title=_default_title(row.get("Title")),
+            review=str(row["Review"]),
+            examples=example_library,
+            n=n_shot,
+            seed=row_seed,
+        ))
+
+    raw_outputs = generate_response_batch(
+        model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens
+    )
+
+    ids, predictions, debug_records = [], [], []
+    start = time.time()
+    id_col = "Review_id" if "Review_id" in test_df.columns else test_df.columns[0]
+    for step, ((_, row), raw_output) in enumerate(zip(rows, raw_outputs)):
+        parsed, parse_failed = extract_rating_from_output(raw_output, return_parse_info=True)
+        ids.append(row[id_col])
+        predictions.append(int(parsed))
+        debug_records.append({"sample_idx": step, "raw_output": raw_output,
+                               "predicted_rating": int(parsed), "fallback_used": parse_failed})
+
+    return _build_inference_result(test_df, ids, predictions, debug_records, time.time() - start)
+
+
+def run_lora_inference_batch(
+    lora_model,
+    tokenizer,
+    test_df: pd.DataFrame,
+    batch_size: int = 8,
+    max_new_tokens: int = 10,
+) -> Dict[str, Any]:
+    """批量版 LoRA 推理，输入输出格式与 run_lora_inference 完全一致。"""
+    rows = list(test_df.iterrows())
+    prompts = [
+        build_finetuned_prompt(
+            title=_default_title(row.get("Title")),
+            review=str(row["Review"]),
+        )
+        for _, row in rows
+    ]
+    raw_outputs = generate_response_batch(
+        lora_model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens
+    )
+
+    ids, predictions, debug_records = [], [], []
+    start = time.time()
+    id_col = "Review_id" if "Review_id" in test_df.columns else test_df.columns[0]
+    for step, ((_, row), raw_output) in enumerate(zip(rows, raw_outputs)):
+        parsed, parse_failed = extract_rating_from_output(raw_output, return_parse_info=True)
+        ids.append(row[id_col])
+        predictions.append(int(parsed))
+        debug_records.append({"sample_idx": step, "raw_output": raw_output,
+                               "predicted_rating": int(parsed), "fallback_used": parse_failed})
+
+    return _build_inference_result(test_df, ids, predictions, debug_records, time.time() - start)
+
+
+def _build_inference_result(
+    test_df: pd.DataFrame,
+    ids: List,
+    predictions: List[int],
+    debug_records: List[Dict],
+    elapsed: float,
+    id_col: str = "Review_id",
+) -> Dict[str, Any]:
+    """构建与 run_inference_loop 相同结构的返回字典。"""
+    if id_col not in test_df.columns:
+        id_col = test_df.columns[0]
+    prediction_df = pd.DataFrame({id_col: ids, "Predicted_Rating": predictions})
+    fallback_count = sum(r["fallback_used"] for r in debug_records)
+    total = len(predictions)
+    prediction_df.attrs["parse_failure_count"] = fallback_count
+    prediction_df.attrs["parse_failure_total"] = total
+    prediction_df.attrs["parse_failure_rate"] = fallback_count / total if total > 0 else 0.0
+    return {
+        "predictions_df": prediction_df,
+        "debug_records": debug_records,
+        "inference_seconds": elapsed,
+        "sample_count": total,
     }

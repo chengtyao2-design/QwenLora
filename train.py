@@ -3,9 +3,11 @@ from importlib import import_module
 from typing import Dict, List, Optional, Sequence
 
 import time
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-from transformers import Trainer, TrainingArguments, default_data_collator
+from transformers import Trainer, TrainingArguments, default_data_collator, set_seed
+from sklearn.metrics import accuracy_score, f1_score
 
 
 class InstructionDataset(Dataset):
@@ -100,11 +102,35 @@ class LoraTrainingConfig:
 
     lora_rank: int = 8  #4
     lora_alpha: int = 16  #8
-    lora_dropout: float = 0.3
+    lora_dropout: float = 0.05  # 指令微调用 0.05~0.1，原 0.3 偏高[v2]
     target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
+        default_factory=lambda: [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",  # FFN 层，覆盖面更广[v2]
+        ]
     )
     use_qlora: bool = False  # 开启后底座模型需已用 4-bit 加载（即 load_tokenizer_and_model 的 use_qlora=True）
+    seed: int = 42  # 全局随机种子，保证训练可复现
+
+
+def compute_metrics(eval_pred):
+    """用 Accuracy + Macro-F1 评估，供 Trainer 选最优 checkpoint。"""
+    logits, labels = eval_pred
+    # logits shape: (N, vocab_size)，取 argmax 得到预测 token id
+    preds = np.argmax(logits, axis=-1)
+    # 过滤掉 labels=-100 的 padding 位置，取每条样本最后一个有效 token
+    # 注意：InstructionDataset 的 labels 里 padding=-100，答案是最后一个非-100 token
+    valid_preds, valid_labels = [], []
+    for pred_row, label_row in zip(preds, labels):
+        valid_mask = label_row != -100
+        if valid_mask.any():
+            valid_preds.append(int(pred_row[valid_mask][-1]))
+            valid_labels.append(int(label_row[valid_mask][-1]))
+    if not valid_labels:
+        return {"accuracy": 0.0, "macro_f1": 0.0}
+    acc = accuracy_score(valid_labels, valid_preds)
+    macro_f1 = f1_score(valid_labels, valid_preds, average="macro", zero_division=0)
+    return {"accuracy": acc, "macro_f1": macro_f1}
 
 
 def train_lora_model(
@@ -120,6 +146,9 @@ def train_lora_model(
     """
     if config is None:
         config = LoraTrainingConfig()
+
+    # 设置全局随机种子，确保结果可复现[v2]
+    set_seed(config.seed)
 
     # Optional sample truncation for quick experiments
     train_data = list(train_records)
@@ -172,8 +201,8 @@ def train_lora_model(
         eval_strategy=config.eval_strategy,
         save_total_limit=config.save_total_limit,
         load_best_model_at_end=True,
-        metric_for_best_model="loss",
-        greater_is_better=False,
+        metric_for_best_model="macro_f1",  # 用 Macro-F1 选最优 checkpoint[v2]
+        greater_is_better=True,
         warmup_steps=config.warmup_steps,
         report_to="none",
         optim=config.optimizer_name,
@@ -187,6 +216,7 @@ def train_lora_model(
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=default_data_collator,
+        compute_metrics=compute_metrics,  # [v2]用 Accuracy + Macro-F1 选最优 checkpoint
     )
 
     start = time.time()
